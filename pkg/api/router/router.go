@@ -41,10 +41,6 @@ func chain(f http.HandlerFunc, middleware ...middleware) http.HandlerFunc {
 	return middleware[0](chain(f, middleware[1:cap(middleware)]...))
 }
 
-const (
-	patternID = "{id:[0-9]+}"
-)
-
 func registerUserHandlers(r *mux.Router, s *Services) {
 	h := api.NewUserHandler(s.UserService)
 
@@ -53,7 +49,7 @@ func registerUserHandlers(r *mux.Router, s *Services) {
 		{"", http.MethodGet, h.ListUsers},
 	})
 
-	register(authz.Require(authz.UserAdmin), r.PathPrefix("/users/"+patternID).Subrouter(), []route{
+	register(authz.Require(authz.UserAdmin), r.PathPrefix("/users/{id:[0-9]+}").Subrouter(), []route{
 		{"", http.MethodGet, h.GetUser},
 		{"", http.MethodPatch, h.UpdateUser},
 		{"", http.MethodDelete, h.DeleteUser},
