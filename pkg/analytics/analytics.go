@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"reflect"
 	"runtime"
 	"time"
 
@@ -32,9 +33,10 @@ import (
 )
 
 var (
-	url             = "https://analytics.pyroscope.io/api/events"
-	gracePeriod     = 5 * time.Minute
-	uploadFrequency = 24 * time.Hour
+	url               = "https://analytics.pyroscope.io/api/events"
+	gracePeriod       = 1 * time.Second
+	snapshotFrequency = 5 * time.Second
+	uploadFrequency   = 10 * time.Second
 )
 
 type StatsProvider interface {
@@ -65,45 +67,14 @@ type Service struct {
 	httpClient *http.Client
 	uploads    int
 
-	stop chan struct{}
-	done chan struct{}
-}
-
-type metrics struct {
-	InstallID            string    `json:"install_id"`
-	RunID                string    `json:"run_id"`
-	Version              string    `json:"version"`
-	Timestamp            time.Time `json:"timestamp"`
-	UploadIndex          int       `json:"upload_index"`
-	GOOS                 string    `json:"goos"`
-	GOARCH               string    `json:"goarch"`
-	GoVersion            string    `json:"go_version"`
-	MemAlloc             int       `json:"mem_alloc"`
-	MemTotalAlloc        int       `json:"mem_total_alloc"`
-	MemSys               int       `json:"mem_sys"`
-	MemNumGC             int       `json:"mem_num_gc"`
-	BadgerMain           int       `json:"badger_main"`
-	BadgerTrees          int       `json:"badger_trees"`
-	BadgerDicts          int       `json:"badger_dicts"`
-	BadgerDimensions     int       `json:"badger_dimensions"`
-	BadgerSegments       int       `json:"badger_segments"`
-	ControllerIndex      int       `json:"controller_index"`
-	ControllerComparison int       `json:"controller_comparison"`
-	ControllerDiff       int       `json:"controller_diff"`
-	ControllerIngest     int       `json:"controller_ingest"`
-	ControllerRender     int       `json:"controller_render"`
-	SpyRbspy             int       `json:"spy_rbspy"`
-	SpyPyspy             int       `json:"spy_pyspy"`
-	SpyGospy             int       `json:"spy_gospy"`
-	SpyEbpfspy           int       `json:"spy_ebpfspy"`
-	SpyPhpspy            int       `json:"spy_phpspy"`
-	SpyDotnetspy         int       `json:"spy_dotnetspy"`
-	SpyJavaspy           int       `json:"spy_javaspy"`
-	AppsCount            int       `json:"apps_count"`
+	stop     chan struct{}
+	done     chan struct{}
+	baseline *storage.Analytics
 }
 
 func (s *Service) Start() {
 	defer close(s.done)
+	s.baseline = s.s.ReadAnalytics()
 	timer := time.NewTimer(gracePeriod)
 	select {
 	case <-s.stop:
@@ -112,31 +83,58 @@ func (s *Service) Start() {
 	}
 	s.sendReport()
 	ticker := time.NewTicker(uploadFrequency)
+	snapshot := time.NewTicker(snapshotFrequency)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
 			s.sendReport()
+		case <-snapshot.C:
+			m := s.getAnalytics()
+			m = s.mergeAnalytics(s.baseline, m)
+			s.s.SaveAnalytics(m)
 		case <-s.stop:
 			return
 		}
 	}
 }
 
+func (s *Service) mergeAnalytics(baseline *storage.Analytics, current *storage.Analytics) *storage.Analytics {
+	retv := storage.Analytics{}
+	cu := reflect.ValueOf(*current)
+	bs := reflect.ValueOf(*baseline)
+	ret := reflect.ValueOf(retv)
+	for i := 0; i < bs.NumField(); i++ {
+		field := bs.Field(i)
+		fieldtype := bs.Type()
+		fieldCurrent := cu.FieldByName(fieldtype.Name())
+		fieldRet := ret.FieldByName(fieldtype.Name())
+		t, ok := fieldtype.Field(i).Tag.Lookup("type")
+		if ok && t == "counter" {
+			switch fieldtype.Kind() {
+			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+				fieldRet.SetInt(field.Int() + fieldCurrent.Int())
+			}
+		}
+
+	}
+	return &retv
+
+}
 func (s *Service) Stop() {
+	s.s.SaveAnalytics(s.getAnalytics())
 	close(s.stop)
 	<-s.done
 }
 
-func (s *Service) sendReport() {
-	logrus.Debug("sending analytics report")
+func (s *Service) getAnalytics() *storage.Analytics {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
 	du := s.s.DiskUsage()
 
 	controllerStats := s.p.Stats()
 
-	m := metrics{
+	m := storage.Analytics{
 		InstallID:            s.s.InstallID(),
 		RunID:                uuid.New().String(),
 		Version:              build.Version,
@@ -168,6 +166,15 @@ func (s *Service) sendReport() {
 		SpyJavaspy:           controllerStats["ingest:javaspy"],
 		AppsCount:            s.p.AppsCount(),
 	}
+
+	return &m
+}
+
+func (s *Service) sendReport() {
+	logrus.Debug("sending analytics report")
+
+	m := s.getAnalytics()
+	m = s.mergeAnalytics(s.baseline, m)
 
 	buf, err := json.Marshal(m)
 	if err != nil {

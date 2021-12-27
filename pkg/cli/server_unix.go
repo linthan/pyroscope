@@ -1,3 +1,4 @@
+//go:build !windows
 // +build !windows
 
 package cli
@@ -14,6 +15,7 @@ import (
 
 func NewServer(c *config.Server) (*Server, error) {
 	svc, err := newServerService(c)
+	svc.logger.Info(fmt.Sprintf("%+v\n", c))
 	if err != nil {
 		return nil, fmt.Errorf("could not initialize server: %w", err)
 	}
